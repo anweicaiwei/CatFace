@@ -195,8 +195,8 @@ def main(args):
         summary_writer=summary_writer, wandb_logger = wandb_logger
     )
     
-    # 初始化最佳训练损失
-    best_train_loss = float('inf')
+    # 初始化最佳训练准确率
+    best_train_accuracy = 0.0
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
@@ -205,11 +205,16 @@ def main(args):
         writer=summary_writer
     )
 
-    loss_am = AverageMeter()
     amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
-
+        # 重置当前epoch的损失统计和准确率统计
+        loss_am = AverageMeter()
+        accuracy_am = AverageMeter()
+        # 初始化当前轮次的最佳批次准确率和对应的批次号
+        current_epoch_best_accuracy = 0.0
+        current_epoch_best_step = 0
+        
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
         for idx, (img, local_labels) in enumerate(train_loader):
@@ -241,7 +246,7 @@ def main(args):
                     lr_scheduler.step()  # 在优化器步骤后调用学习率调度器
 
             with torch.no_grad():
-                # 每10批次记录一次额外的详细日志
+                # 每10批次记录一次额外的详细日志并检查是否需要保存最佳模型
                 if global_step % 10 == 0 and rank == 0:
                     # 计算当前批次的准确率
                     # 获取分类器权重
@@ -270,6 +275,11 @@ def main(args):
                             'Process/Step': global_step,
                             'Process/Epoch': epoch
                         })
+                    
+                    # 检查当前批次准确率是否为当前轮次最佳
+                    if accuracy > current_epoch_best_accuracy:
+                        current_epoch_best_accuracy = accuracy
+                        current_epoch_best_step = global_step
                 
                 if wandb_logger:
                     wandb_logger.log({
@@ -279,35 +289,55 @@ def main(args):
                         'Process/Epoch': epoch
                     })
                     
+                # 计算当前batch的准确率
+                weight = module_partial_fc.weight.detach()
+                cosine = torch.mm(local_embeddings, weight.t())
+                _, predictions = torch.max(cosine, dim=1)
+                accuracy = (predictions == local_labels).float().mean().item()
+                accuracy_am.update(accuracy, img.size(0))
+                
                 # 计算准确率用于callback_logging
                 train_accuracy = None
                 if global_step % cfg.frequent == 0 and rank == 0:
-                    # 获取分类器权重
-                    weight = module_partial_fc.weight.detach()
-                    # 计算嵌入向量与分类器权重的余弦相似度
-                    cosine = torch.mm(local_embeddings, weight.t())
-                    # 获取预测标签
-                    _, predictions = torch.max(cosine, dim=1)
-                    # 计算准确率
-                    train_accuracy = (predictions == local_labels).float().mean().item()
+                    train_accuracy = accuracy
                 
                 loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp, train_accuracy)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
-            
-            # 基于训练损失保存最佳模型（适用于没有验证数据的情况）
-            with torch.no_grad():
-                if loss_am.avg < best_train_loss and rank == 0:
-                    best_train_loss = loss_am.avg
-                    # 保存最佳模型
-                    best_model_path = os.path.join(output_dir, "best_model.pt")
-                    torch.save(backbone.module.state_dict(), best_model_path)
-                    logging.info(f"[训练批次 #{global_step}] 已保存基于训练损失的最佳模型到: {best_model_path}, 最佳损失: {best_train_loss:.4f}")
-
-        # 只保存最佳模型（在callback_verification中处理）和最后一轮模型（在训练结束后处理）
-        pass
+        
+        # 轮次结束时，保存当前轮次中准确率最高的那一次模型
+        with torch.no_grad():
+            if current_epoch_best_step > 0 and rank == 0:
+                # 保存当前轮次最佳模型
+                best_model_path = os.path.join(output_dir, "best_model.pt")
+                torch.save(backbone.module.state_dict(), best_model_path)
+                logging.info(f"[第{epoch+1}轮结束] 已保存当前轮次中准确率最高的模型（批次 #{current_epoch_best_step}）到: {best_model_path}, 批次准确率: {current_epoch_best_accuracy:.4f}")
+                
+                # 如果有wandb_logger，记录轮次最佳模型信息
+                if wandb_logger:
+                    wandb_logger.log({
+                        'Best/Epoch Batch Accuracy': current_epoch_best_accuracy,
+                        'Process/Best Step in Epoch': current_epoch_best_step,
+                        'Process/Best Epoch': epoch+1,
+                        'Process/Step': global_step
+                    })
+                
+                # 更新全局最佳准确率和保存全局最佳模型
+                if current_epoch_best_accuracy > best_train_accuracy:
+                    best_train_accuracy = current_epoch_best_accuracy
+                    global_best_model_path = os.path.join(output_dir, "global_best_model.pt")
+                    torch.save(backbone.module.state_dict(), global_best_model_path)
+                    logging.info(f"[全局最佳] 已保存全局准确率最高的模型到: {global_best_model_path}, 全局最佳准确率: {best_train_accuracy:.4f}")
+                    
+                    if wandb_logger:
+                        wandb_logger.log({
+                            'Best/Global Batch Accuracy': best_train_accuracy,
+                            'Process/Global Best Step': current_epoch_best_step,
+                            'Process/Global Best Epoch': epoch+1,
+                            'Process/Step': global_step
+                        })
                 
         if cfg.dali:
             train_loader.reset()

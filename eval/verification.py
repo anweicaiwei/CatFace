@@ -198,29 +198,65 @@ def evaluate(embeddings, actual_issame, nrof_folds=10, pca=0):
 
 @torch.no_grad()
 def load_bin(path, image_size):
+    """
+    加载预计算的验证集二进制文件
+    
+    Args:
+        path (str): 二进制文件路径
+        image_size (tuple): 图像尺寸 (height, width)
+        
+    Returns:
+        tuple: (data_list, issame_list)
+            data_list: 包含两个torch.Tensor的列表，分别对应原始图像和水平翻转后的图像
+                      每个Tensor的形状为：(len(issame_list)*2, 3, image_size[0], image_size[1])
+            issame_list: 布尔值列表，表示验证集中每对图像是否属于同一个人/类别
+    """
+    # 尝试以Python 2格式加载pickle文件
     try:
         with open(path, 'rb') as f:
             bins, issame_list = pickle.load(f)  # py2
     except UnicodeDecodeError as e:
+        # 如果失败，尝试以Python 3格式加载（指定encoding='bytes'）
         with open(path, 'rb') as f:
             bins, issame_list = pickle.load(f, encoding='bytes')  # py3
+    
+    # 创建两个空的torch.Tensor，分别用于存储原始图像和水平翻转后的图像
     data_list = []
-    for flip in [0, 1]:
+    for flip in [0, 1]:  # 0: 原始图像, 1: 水平翻转图像
+        # 计算数据大小：issame_list长度*2（每对图像），3个通道，指定的图像尺寸
         data = torch.empty((len(issame_list) * 2, 3, image_size[0], image_size[1]))
         data_list.append(data)
+    
+    # 遍历所有图像对
     for idx in range(len(issame_list) * 2):
+        # 获取当前图像的二进制数据
         _bin = bins[idx]
+        # 使用mxnet解码图像
         img = mx.image.imdecode(_bin)
+        
+        # 如果图像高度不等于目标尺寸，调整图像大小
         if img.shape[1] != image_size[0]:
             img = mx.image.resize_short(img, image_size[0])
+        
+        # 将图像维度从 (height, width, channel) 转换为 (channel, height, width)
         img = nd.transpose(img, axes=(2, 0, 1))
+        
+        # 处理原始图像和水平翻转图像
         for flip in [0, 1]:
             if flip == 1:
+                # 水平翻转图像（沿宽度轴）
                 img = mx.ndarray.flip(data=img, axis=2)
+            # 将mxnet的ndarray转换为pytorch的Tensor并存储
             data_list[flip][idx][:] = torch.from_numpy(img.asnumpy())
+        
+        # 每处理1000张图像打印一次进度
         if idx % 1000 == 0:
             print('loading bin', idx)
+    
+    # 打印加载完成的数据形状
     print(data_list[0].shape)
+    
+    # 返回处理后的数据列表和issame列表
     return data_list, issame_list
 
 @torch.no_grad()

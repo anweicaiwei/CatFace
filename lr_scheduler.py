@@ -4,7 +4,7 @@ import torch
 import warnings
 
 class PolynomialLRWarmup(_LRScheduler):
-    def __init__(self, optimizer, warmup_iters, total_iters=5, power=1.0, last_epoch=-1, verbose=False):
+    def __init__(self, optimizer, warmup_iters, total_iters=5, power=1.0, last_epoch=0, verbose=False):
         super().__init__(optimizer, last_epoch=last_epoch, verbose=verbose)
         self.total_iters = total_iters
         self.power = power
@@ -16,7 +16,11 @@ class PolynomialLRWarmup(_LRScheduler):
             warnings.warn("To get the last learning rate computed by the scheduler, "
                           "please use `get_last_lr()`.", UserWarning)
 
-        if self.last_epoch == 0 or self.last_epoch > self.total_iters:
+        # 如果是第一次调用，返回基础学习率
+        if self.last_epoch == 0:
+            return self.base_lrs
+        
+        if self.last_epoch > self.total_iters:
             return [group["lr"] for group in self.optimizer.param_groups]
 
         if self.last_epoch <= self.warmup_iters:
