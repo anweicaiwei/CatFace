@@ -65,63 +65,90 @@ class IBasicBlock(nn.Module):
             return self.forward_impl(x)
 
 class FourierTransformLayer(nn.Module):
-    def __init__(self, radius_ratio, smoothness,img_size):
+    """傅里叶变换增强层
+    
+    用于在ResNet架构前对图像进行傅里叶变换增强，通过掩码增强高频信息
+    提升模型对细节特征的捕捉能力
+    """
+    def __init__(self, radius_ratio, smoothness, img_size):
+        """初始化傅里叶变换增强层
+        
+        Args:
+            radius_ratio: 半径比率，控制掩码中心区域大小
+            smoothness: 平滑系数，控制掩码的平滑过渡
+            img_size: 输入图像尺寸
+        """
         super(FourierTransformLayer, self).__init__()
-        self.radius_ratio = radius_ratio
-        self.smoothness = smoothness
+        self.radius_ratio = radius_ratio  # 半径比率
+        self.smoothness = smoothness      # 平滑系数
+        # 可学习参数，用于调整不同通道的增强效果
         self.learnable_param = nn.Parameter(torch.ones(3, img_size, img_size))
 
     def create_smooth_mask(self, h, w):
+        """创建平滑掩码
+        
+        生成一个中心平滑、边缘逐渐增强的掩码，用于增强傅里叶域中的高频信息
+        
+        Args:
+            h: 图像高度
+            w: 图像宽度
+            
+        Returns:
+            平滑掩码，形状为 [3, h, w]
+        """
+        # 初始化全1掩码
         mask = torch.ones((h, w), dtype=torch.float32).cuda()
+        # 计算图像中心点
         center_h, center_w = h // 2, w // 2
+        # 计算掩码中心区域半径
         radius_h, radius_w = int(h * self.radius_ratio), int(w * self.radius_ratio)
 
+        # 遍历图像每个像素点
         for i in range(h):
             for j in range(w):
+                # 计算当前点到中心点的距离
                 dist_h = abs(i - center_h)
                 dist_w = abs(j - center_w)
 
+                # 中心点附近使用平滑系数
                 if dist_h**2 + dist_w**2 <= 1:
                     mask[i, j] = self.smoothness
                 else:
+                    # 归一化距离到[0,1]范围
                     dist_h_norm = dist_h / (h / 2)
                     dist_w_norm = dist_w / (w / 2)
+                    # 计算欧几里得距离
                     distance = np.sqrt(dist_h_norm ** 2 + dist_w_norm ** 2)
+                    # 边缘区域逐渐增强，确保最小值为smoothness
                     mask[i, j] = max(self.smoothness, distance)
 
+        # 扩展掩码到3通道
         return mask.unsqueeze(0).expand(3, -1, -1)
-        #return mask
 
     def forward(self, x):
+        """前向传播
+        
+        对输入图像进行傅里叶变换，应用掩码增强高频信息，然后进行逆变换重建图像
+        
+        Args:
+            x: 输入图像张量，形状为 [B, C, H, W]
+            
+        Returns:
+            增强后的图像张量，形状为 [B, C, H, W]
+        """
         # 1. 对图像进行傅里叶变换
-        img_fft = torch.fft.fft2(x)
-        img_fft_shifted = torch.fft.fftshift(img_fft).cuda()
+        img_fft = torch.fft.fft2(x)                # 二维傅里叶变换
+        img_fft_shifted = torch.fft.fftshift(img_fft).cuda()  # 频域中心化
 
-        # 2. 创建平滑掩码
-        h, w = img_fft_shifted.shape[-2:]
-        smooth_mask = self.create_smooth_mask(h, w)
-        #print(self.learnable_param)
-        # 应用平滑掩码
-        #print(img_fft_shifted.device)
-        #print(smooth_mask.device)
-        #print(self.learnable_param)
+        # 2. 应用平滑掩码增强高频信息
+        h, w = img_fft_shifted.shape[-2:]          # 获取图像尺寸
+        smooth_mask = self.create_smooth_mask(h, w)  # 创建平滑掩码
+        # 应用掩码和可学习参数
         img_filtered = img_fft_shifted * smooth_mask * self.learnable_param
-        """
-        # 设置打印选项，确保打印完整内容
-        torch.set_printoptions(profile="full")
-
-        # 打印张量的维度
-        print("Tensor shape:", self.learnable_param.shape)
-
-        # 打印完整的张量内容
-        print("Tensor data:\n", self.learnable_param)
-
-        # 恢复默认打印选项，以免影响后续其他输出
-        torch.set_printoptions(profile="default")
-        """
-        # 3. 逆傅里叶变换
-        img_enhanced = torch.fft.ifftshift(img_filtered)
-        img_reconstructed = torch.fft.ifft2(img_enhanced).real  # 取实部
+        
+        # 3. 逆傅里叶变换重建图像
+        img_enhanced = torch.fft.ifftshift(img_filtered)  # 频域去中心化
+        img_reconstructed = torch.fft.ifft2(img_enhanced).real  # 逆傅里叶变换，取实部
 
         return img_reconstructed
 

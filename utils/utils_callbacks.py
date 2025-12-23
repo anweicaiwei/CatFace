@@ -13,12 +13,13 @@ from torch import distributed
 
 class CallBackVerification(object):
     
-    def __init__(self, val_targets, rec_prefix, summary_writer=None, image_size=(112, 112), wandb_logger=None):
+    def __init__(self, val_targets, rec_prefix, output_dir, summary_writer=None, image_size=(112, 112), wandb_logger=None):
         self.rank: int = distributed.get_rank()
         self.highest_acc: float = 0.0
         self.highest_acc_list: List[float] = [0.0] * len(val_targets)
         self.ver_list: List[object] = []
         self.ver_name_list: List[str] = []
+        self.output_dir = output_dir  # 保存最佳模型的目录
         if self.rank is 0:
             self.init_dataset(val_targets=val_targets, data_dir=rec_prefix, image_size=image_size)
 
@@ -46,6 +47,10 @@ class CallBackVerification(object):
 
             if acc2 > self.highest_acc_list[i]:
                 self.highest_acc_list[i] = acc2
+                # 保存最佳模型
+                best_model_path = os.path.join(self.output_dir, "best_model.pt")
+                torch.save(backbone.module.state_dict(), best_model_path)
+                logging.info('[%s][%d]已保存最佳模型到: %s' % (self.ver_name_list[i], global_step, best_model_path))
             logging.info(
                 '[%s][%d]Accuracy-Highest: %1.5f' % (self.ver_name_list[i], global_step, self.highest_acc_list[i]))
             results.append(acc2)
@@ -60,9 +65,13 @@ class CallBackVerification(object):
 
     def __call__(self, num_update, backbone: torch.nn.Module):
         if self.rank is 0 and num_update > 0:
+            logging.info("="*60)
+            logging.info(f"开始验证 - Global Step: {num_update}")
+            logging.info("="*60)
             backbone.eval()
             self.ver_test(backbone, num_update)
             backbone.train()
+            logging.info("验证完成\n")
 
 
 class CallBackLogging(object):
@@ -85,7 +94,8 @@ class CallBackLogging(object):
                  epoch: int,
                  fp16: bool,
                  learning_rate: float,
-                 grad_scaler: torch.cuda.amp.GradScaler):
+                 grad_scaler: torch.cuda.amp.GradScaler,
+                 accuracy: float = None):
         if self.rank == 0 and global_step > 0 and global_step % self.frequent == 0:
             if self.init:
                 try:
@@ -106,17 +116,33 @@ class CallBackLogging(object):
                     self.writer.add_scalar('time_for_end', time_for_end, global_step)
                     self.writer.add_scalar('learning_rate', learning_rate, global_step)
                     self.writer.add_scalar('loss', loss.avg, global_step)
+                    # 如果提供了准确率，添加到TensorBoard
+                    if accuracy is not None:
+                        self.writer.add_scalar('accuracy/train_accuracy', accuracy, global_step)
+                # 准备详细的日志信息
+                log_info = {
+                    "速度": f"{speed_total:.2f} 样本/秒",
+                    "当前批次损失": f"{loss.val:.4f}",
+                    "平均损失": f"{loss.avg:.4f}",
+                    "学习率": f"{learning_rate:.6f}",
+                    "轮次": epoch,
+                    "全局步数": global_step,
+                    "剩余时间": f"{time_for_end:.1f} 小时"
+                }
+                
+                # 如果提供了准确率，添加到日志信息中
+                if accuracy is not None:
+                    log_info["训练准确率"] = f"{accuracy:.4f}"
+                
                 if fp16:
-                    msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Fp16 Grad Scale: %2.f   Required: %1.f hours" % (
-                              speed_total, loss.avg, learning_rate, epoch, global_step,
-                              grad_scaler.get_scale(), time_for_end
-                          )
-                else:
-                    msg = "Speed %.2f samples/sec   Loss %.4f   LearningRate %.6f   Epoch: %d   Global Step: %d   " \
-                          "Required: %1.f hours" % (
-                              speed_total, loss.avg, learning_rate, epoch, global_step, time_for_end
-                          )
+                    log_info["Fp16梯度缩放"] = f"{grad_scaler.get_scale():.2f}"
+                
+                # 生成格式化的日志消息
+                msg = f"[训练批次 #{global_step}] "
+                for key, value in log_info.items():
+                    msg += f"{key}: {value}, "
+                msg = msg.rstrip(", ")
+                
                 logging.info(msg)
                 loss.reset()
                 self.tic = time.time()

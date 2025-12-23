@@ -26,9 +26,6 @@ from testarcface import runtest
 
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
-# 假设这是指定保存目录
-save_dir = "save_directory"
-os.makedirs(save_dir, exist_ok=True)  # 确保目录存在
 try:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -47,7 +44,9 @@ except KeyError:
 
 
 def main(args):
-
+    # 获取当前时间作为训练开始时间
+    training_start_time = datetime.now()
+    
     # get config
     cfg = get_config(args.config)
     # global control random seed
@@ -55,11 +54,21 @@ def main(args):
 
     torch.cuda.set_device(local_rank)
 
-    os.makedirs(cfg.output, exist_ok=True)
-    init_logging(rank, cfg.output)
+    # Create timestamp folder for output
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = os.path.join(cfg.output, timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 初始化日志系统
+    init_logging(rank, output_dir)
+    logging.info("="*80)
+    logging.info(f"训练开始于: {training_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"配置文件: {args.config}")
+    logging.info(f"输出目录: {output_dir}")
+    logging.info("="*80)
 
     summary_writer = (
-        SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
+        SummaryWriter(log_dir=os.path.join(output_dir, "tensorboard"))
         if rank == 0
         else None
     )
@@ -152,23 +161,42 @@ def main(args):
     start_epoch = 0
     global_step = 0
     if cfg.resume:
-        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
-        start_epoch = dict_checkpoint["epoch"]
-        global_step = dict_checkpoint["global_step"]
-        backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
-        opt.load_state_dict(dict_checkpoint["state_optimizer"])
-        lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
-        del dict_checkpoint
+        # When resuming, we look for checkpoints in the latest timestamp folder
+        # This assumes there's only one checkpoint folder, or you need to modify to select a specific one
+        timestamp_folders = [f for f in os.listdir(cfg.output) if os.path.isdir(os.path.join(cfg.output, f))]
+        if timestamp_folders:
+            latest_folder = max(timestamp_folders)
+            checkpoint_path = os.path.join(cfg.output, latest_folder, f"checkpoint_gpu_{rank}.pt")
+            if os.path.exists(checkpoint_path):
+                logging.info(f"从检查点恢复训练: {checkpoint_path}")
+                dict_checkpoint = torch.load(checkpoint_path)
+                start_epoch = dict_checkpoint["epoch"]
+                global_step = dict_checkpoint["global_step"]
+                backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
+                module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
+                opt.load_state_dict(dict_checkpoint["state_optimizer"])
+                lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
+                logging.info(f"成功恢复到 epoch: {start_epoch}, global_step: {global_step}")
+                del dict_checkpoint
+            else:
+                logging.warning(f"未找到检查点文件: {checkpoint_path}")
+        else:
+            logging.warning(f"在 {cfg.output} 中未找到时间戳文件夹")
 
+    logging.info("\n===== 训练配置 =====")
     for key, value in cfg.items():
         num_space = 25 - len(key)
-        logging.info(": " + key + " " * num_space + str(value))
+        logging.info(f": {key}{' ' * num_space}{str(value)}")
+    logging.info("==================\n")
 
     callback_verification = CallBackVerification(
         val_targets=cfg.val_targets, rec_prefix=cfg.rec, 
+        output_dir=output_dir,  # 传入输出目录用于保存最佳模型
         summary_writer=summary_writer, wandb_logger = wandb_logger
     )
+    
+    # 初始化最佳训练损失
+    best_train_loss = float('inf')
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
@@ -203,15 +231,46 @@ def main(args):
                     amp.step(opt)
                     amp.update()
                     opt.zero_grad()
+                    lr_scheduler.step()  # 在优化器步骤后调用学习率调度器
             else:
                 loss.backward()
                 if global_step % cfg.gradient_acc == 0:
                     torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                     opt.step()
                     opt.zero_grad()
-            lr_scheduler.step()
+                    lr_scheduler.step()  # 在优化器步骤后调用学习率调度器
 
             with torch.no_grad():
+                # 每10批次记录一次额外的详细日志
+                if global_step % 10 == 0 and rank == 0:
+                    # 计算当前批次的准确率
+                    # 获取分类器权重
+                    weight = module_partial_fc.weight.detach()
+                    # 计算嵌入向量与分类器权重的余弦相似度
+                    cosine = torch.mm(local_embeddings, weight.t())
+                    # 获取预测标签
+                    _, predictions = torch.max(cosine, dim=1)
+                    # 计算准确率
+                    accuracy = (predictions == local_labels).float().mean().item()
+                    
+                    batch_loss = loss.item()
+                    avg_loss = loss_am.avg
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    
+                    # 记录详细训练参数到日志，包括准确率
+                    logging.info(f"[每10批次] 全局步数: {global_step}, 轮次: {epoch}, "
+                               f"批次索引: {idx}, 当前损失: {batch_loss:.4f}, "
+                               f"平均损失: {avg_loss:.4f}, 学习率: {current_lr:.6f}, "
+                               f"训练准确率: {accuracy:.4f}")
+                    
+                    # 如果有wandb_logger，也记录准确率
+                    if wandb_logger:
+                        wandb_logger.log({
+                            'Accuracy/Train Accuracy': accuracy,
+                            'Process/Step': global_step,
+                            'Process/Epoch': epoch
+                        })
+                
                 if wandb_logger:
                     wandb_logger.log({
                         'Loss/Step Loss': loss.item(),
@@ -220,45 +279,61 @@ def main(args):
                         'Process/Epoch': epoch
                     })
                     
+                # 计算准确率用于callback_logging
+                train_accuracy = None
+                if global_step % cfg.frequent == 0 and rank == 0:
+                    # 获取分类器权重
+                    weight = module_partial_fc.weight.detach()
+                    # 计算嵌入向量与分类器权重的余弦相似度
+                    cosine = torch.mm(local_embeddings, weight.t())
+                    # 获取预测标签
+                    _, predictions = torch.max(cosine, dim=1)
+                    # 计算准确率
+                    train_accuracy = (predictions == local_labels).float().mean().item()
+                
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp, train_accuracy)
 
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
+            
+            # 基于训练损失保存最佳模型（适用于没有验证数据的情况）
+            with torch.no_grad():
+                if loss_am.avg < best_train_loss and rank == 0:
+                    best_train_loss = loss_am.avg
+                    # 保存最佳模型
+                    best_model_path = os.path.join(output_dir, "best_model.pt")
+                    torch.save(backbone.module.state_dict(), best_model_path)
+                    logging.info(f"[训练批次 #{global_step}] 已保存基于训练损失的最佳模型到: {best_model_path}, 最佳损失: {best_train_loss:.4f}")
 
-        if cfg.save_all_states:
-            checkpoint = {
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "state_dict_backbone": backbone.module.state_dict(),
-                "state_dict_softmax_fc": module_partial_fc.state_dict(),
-                "state_optimizer": opt.state_dict(),
-                "state_lr_scheduler": lr_scheduler.state_dict()
-            }
-            torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
-
-        if rank == 0:
-            path_module = os.path.join(cfg.output, "model.pt")
-            torch.save(backbone.module.state_dict(), path_module)
-            if wandb_logger and cfg.save_artifacts:
-                artifact_name = f"{run_name}_E{epoch}"
-                model = wandb.Artifact(artifact_name, type='model')
-                model.add_file(path_module)
-                wandb_logger.log_artifact(model)
+        # 只保存最佳模型（在callback_verification中处理）和最后一轮模型（在训练结束后处理）
+        pass
                 
         if cfg.dali:
             train_loader.reset()
 
     if rank == 0:
-        path_module = os.path.join(cfg.output, "model.pt")
-        torch.save(backbone.module.state_dict(), path_module)
+        # 保存最后一轮模型
+        last_model_path = os.path.join(output_dir, "last_model.pt")
+        torch.save(backbone.module.state_dict(), last_model_path)
+        logging.info(f"已保存最后一轮模型到: {last_model_path}")
    
-
         if wandb_logger and cfg.save_artifacts:
             artifact_name = f"{run_name}_Final"
             model = wandb.Artifact(artifact_name, type='model')
-            model.add_file(path_module)
+            model.add_file(last_model_path)
             wandb_logger.log_artifact(model)
+            logging.info(f"已将最终模型上传到 WandB: {artifact_name}")
+    
+    # 记录训练结束信息
+    training_end_time = datetime.now()
+    training_duration = training_end_time - training_start_time
+    logging.info("="*80)
+    logging.info(f"训练结束于: {training_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"总训练时间: {str(training_duration).split('.')[0]} (小时:分钟:秒)")
+    logging.info(f"最终输出目录: {output_dir}")
+    logging.info("训练完成！")
+    logging.info("="*80)
 
 
 

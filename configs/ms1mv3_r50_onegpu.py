@@ -19,9 +19,9 @@ config.lr = 0.02
 config.verbose = 2000
 config.dali = False
 
-config.rec = "/train_tmp/ms1m-retinaface-t1"
-config.num_classes = 93431
-config.num_image = 5179510
-config.num_epoch = 20
+config.rec = "data/test_cat"
+config.num_classes = 360
+config.num_image = 2453
+config.num_epoch = 100
 config.warmup_epoch = 0
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]
