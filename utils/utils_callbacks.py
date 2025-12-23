@@ -16,18 +16,34 @@ class CallBackVerification(object):
     def __init__(self, val_targets, rec_prefix, output_dir, summary_writer=None, image_size=(112, 112), wandb_logger=None):
         self.rank: int = distributed.get_rank()
         self.highest_acc: float = 0.0
-        self.highest_acc_list: List[float] = [0.0] * len(val_targets)
+        self.highest_acc_list: List[float] = []
         self.ver_list: List[object] = []
         self.ver_name_list: List[str] = []
         self.output_dir = output_dir  # 保存最佳模型的目录
         if self.rank is 0:
             self.init_dataset(val_targets=val_targets, data_dir=rec_prefix, image_size=image_size)
+            # 根据实际加载的验证集数量初始化最高准确率列表
+            self.highest_acc_list = [0.0] * len(self.ver_list)
+            
+            # 检查是否有验证集被加载
+            if len(self.ver_list) == 0:
+                logging.warning(f"没有找到任何验证集文件。请检查配置文件中的val_targets和rec_prefix参数，确保验证集文件存在于{rec_prefix}目录下")
+                logging.info(f"配置的val_targets: {val_targets}")
 
         self.summary_writer = summary_writer
         self.wandb_logger = wandb_logger
 
     def ver_test(self, backbone: torch.nn.Module, global_step: int):
         results = []
+        # 初始化当前验证轮次的最佳准确率
+        current_val_best_acc = 0.0
+        current_val_best_name = ""
+        
+        # 检查是否有验证集
+        if len(self.ver_list) == 0:
+            logging.warning(f"[验证][{global_step}] 没有找到有效的验证集，跳过验证")
+            return results
+            
         for i in range(len(self.ver_list)):
             acc1, std1, acc2, std2, xnorm, embeddings_list = verification.test(
                 self.ver_list[i], backbone, 10, 10)
@@ -44,24 +60,50 @@ class CallBackVerification(object):
                     # f'Acc/val-std1 {self.ver_name_list[i]}': std1,
                     # f'Acc/val-std2 {self.ver_name_list[i]}': acc2,
                 })
+            
+            # 更新当前验证轮次的最佳准确率
+            if acc2 > current_val_best_acc:
+                current_val_best_acc = acc2
+                current_val_best_name = self.ver_name_list[i]
 
             if acc2 > self.highest_acc_list[i]:
                 self.highest_acc_list[i] = acc2
                 # 保存最佳模型
                 best_model_path = os.path.join(self.output_dir, "best_model.pt")
                 torch.save(backbone.module.state_dict(), best_model_path)
-                logging.info('[%s][%d]已保存最佳模型到: %s' % (self.ver_name_list[i], global_step, best_model_path))
+                # 同时保存一个带有验证集名称和准确率的模型文件
+                detailed_best_model_path = os.path.join(self.output_dir, f"best_model_{self.ver_name_list[i]}_{acc2:.4f}.pt")
+                torch.save(backbone.module.state_dict(), detailed_best_model_path)
+                logging.info('[%s][%d]已保存验证集最佳模型到: %s' % (self.ver_name_list[i], global_step, best_model_path))
+                logging.info('[%s][%d]已保存详细验证集最佳模型到: %s' % (self.ver_name_list[i], global_step, detailed_best_model_path))
             logging.info(
                 '[%s][%d]Accuracy-Highest: %1.5f' % (self.ver_name_list[i], global_step, self.highest_acc_list[i]))
             results.append(acc2)
 
     def init_dataset(self, val_targets, data_dir, image_size):
+        found_datasets = []
         for name in val_targets:
             path = os.path.join(data_dir, name + ".bin")
             if os.path.exists(path):
-                data_set = verification.load_bin(path, image_size)
-                self.ver_list.append(data_set)
-                self.ver_name_list.append(name)
+                try:
+                    data_set = verification.load_bin(path, image_size)
+                    # data_set 是 (data_list, issame_list)，issame_list 中的每个元素代表一对图像样本
+                    num_pairs = len(data_set[1])
+                    num_images = num_pairs * 2
+                    print(f"验证集 {name} 包含 {num_pairs} 对样本（共 {num_images} 张图像）")
+                    self.ver_list.append(data_set)
+                    self.ver_name_list.append(name)
+                    found_datasets.append(name)
+                    logging.info(f"成功加载验证集: {name} - 路径: {path}")
+                except Exception as e:
+                    logging.error(f"加载验证集失败: {name} - 错误: {str(e)}")
+            else:
+                logging.warning(f"验证集文件不存在: {path}")
+                
+        if not found_datasets:
+            logging.warning(f"在目录 {data_dir} 中没有找到任何验证集文件")
+        else:
+            logging.info(f"成功加载 {len(found_datasets)} 个验证集: {found_datasets}")
 
     def __call__(self, num_update, backbone: torch.nn.Module):
         if self.rank is 0 and num_update > 0:

@@ -195,8 +195,6 @@ def main(args):
         summary_writer=summary_writer, wandb_logger = wandb_logger
     )
     
-    # 初始化最佳训练准确率
-    best_train_accuracy = 0.0
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
@@ -276,7 +274,7 @@ def main(args):
                             'Process/Epoch': epoch
                         })
                     
-                    # 检查当前批次准确率是否为当前轮次最佳
+                    # 检查当前批次准确率是否为当前轮次最佳（仅用于日志记录）
                     if accuracy > current_epoch_best_accuracy:
                         current_epoch_best_accuracy = accuracy
                         current_epoch_best_step = global_step
@@ -307,15 +305,13 @@ def main(args):
                 if global_step % cfg.verbose == 0 and global_step > 0:
                     callback_verification(global_step, backbone)
         
-        # 轮次结束时，保存当前轮次中准确率最高的那一次模型
+        # 轮次结束时，记录当前轮次中准确率最高的批次信息（仅用于日志记录）
         with torch.no_grad():
             if current_epoch_best_step > 0 and rank == 0:
-                # 保存当前轮次最佳模型
-                best_model_path = os.path.join(output_dir, "best_model.pt")
-                torch.save(backbone.module.state_dict(), best_model_path)
-                logging.info(f"[第{epoch+1}轮结束] 已保存当前轮次中准确率最高的模型（批次 #{current_epoch_best_step}）到: {best_model_path}, 批次准确率: {current_epoch_best_accuracy:.4f}")
+                # 记录当前轮次最佳批次信息
+                logging.info(f"[第{epoch+1}轮结束] 当前轮次中准确率最高的批次为 #{current_epoch_best_step}, 批次准确率: {current_epoch_best_accuracy:.4f}")
                 
-                # 如果有wandb_logger，记录轮次最佳模型信息
+                # 如果有wandb_logger，记录轮次最佳批次信息
                 if wandb_logger:
                     wandb_logger.log({
                         'Best/Epoch Batch Accuracy': current_epoch_best_accuracy,
@@ -323,21 +319,6 @@ def main(args):
                         'Process/Best Epoch': epoch+1,
                         'Process/Step': global_step
                     })
-                
-                # 更新全局最佳准确率和保存全局最佳模型
-                if current_epoch_best_accuracy > best_train_accuracy:
-                    best_train_accuracy = current_epoch_best_accuracy
-                    global_best_model_path = os.path.join(output_dir, "global_best_model.pt")
-                    torch.save(backbone.module.state_dict(), global_best_model_path)
-                    logging.info(f"[全局最佳] 已保存全局准确率最高的模型到: {global_best_model_path}, 全局最佳准确率: {best_train_accuracy:.4f}")
-                    
-                    if wandb_logger:
-                        wandb_logger.log({
-                            'Best/Global Batch Accuracy': best_train_accuracy,
-                            'Process/Global Best Step': current_epoch_best_step,
-                            'Process/Global Best Epoch': epoch+1,
-                            'Process/Step': global_step
-                        })
                 
         if cfg.dali:
             train_loader.reset()

@@ -16,7 +16,7 @@ config.momentum = 0.9
 config.weight_decay = 5e-4
 config.batch_size = 128
 config.lr = 0.02
-config.verbose = 2000
+config.verbose = 20  # 每100个全局步骤进行一次验证，这样可以在训练过程中看到验证结果
 config.dali = False
 
 config.rec = "data/test_cat"

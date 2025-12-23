@@ -171,8 +171,18 @@ def calculate_val_far(threshold, dist, actual_issame):
     n_diff = np.sum(np.logical_not(actual_issame))
     # print(true_accept, false_accept)
     # print(n_same, n_diff)
-    val = float(true_accept) / float(n_same)
-    far = float(false_accept) / float(n_diff)
+    
+    # 添加除以零的保护
+    if n_same == 0:
+        val = 0.0  # 或者其他合适的默认值
+    else:
+        val = float(true_accept) / float(n_same)
+    
+    if n_diff == 0:
+        far = 0.0  # 或者其他合适的默认值
+    else:
+        far = float(false_accept) / float(n_diff)
+    
     return val, far
 
 
@@ -215,10 +225,12 @@ def load_bin(path, image_size):
     try:
         with open(path, 'rb') as f:
             bins, issame_list = pickle.load(f)  # py2
+            print(f"Loaded {len(bins)} images from {path} (Python 2 format)")
     except UnicodeDecodeError as e:
         # 如果失败，尝试以Python 3格式加载（指定encoding='bytes'）
         with open(path, 'rb') as f:
             bins, issame_list = pickle.load(f, encoding='bytes')  # py3
+            print(f"Loaded {len(bins)} images from {path} (Python 3 format)")
     
     # 创建两个空的torch.Tensor，分别用于存储原始图像和水平翻转后的图像
     data_list = []
