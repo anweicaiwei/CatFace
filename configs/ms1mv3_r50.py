@@ -15,13 +15,15 @@ config.fp16 = True
 config.momentum = 0.9
 config.weight_decay = 5e-4
 config.batch_size = 128
-config.lr = 0.1
-config.verbose = 2000
-config.dali = False
+config.lr = 0.02
+config.verbose = 20  # 每100个全局步骤进行一次验证，这样可以在训练过程中看到验证结果
+config.dali = True
+config.num_workers = 1
 
-config.rec = "/train_tmp/ms1m-retinaface-t1"
-config.num_classes = 93431
-config.num_image = 5179510
-config.num_epoch = 20
+
+config.rec = "data/test_cat"
+config.num_classes = 360
+config.num_image = 2453
+config.num_epoch = 40
 config.warmup_epoch = 0
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]

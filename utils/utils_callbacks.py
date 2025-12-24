@@ -66,16 +66,16 @@ class CallBackVerification(object):
                 current_val_best_acc = acc2
                 current_val_best_name = self.ver_name_list[i]
 
-            if acc2 > self.highest_acc_list[i]:
+            if acc2 >= self.highest_acc_list[i]:
                 self.highest_acc_list[i] = acc2
                 # 保存最佳模型
                 best_model_path = os.path.join(self.output_dir, "best_model.pt")
                 torch.save(backbone.module.state_dict(), best_model_path)
                 # 同时保存一个带有验证集名称和准确率的模型文件
-                detailed_best_model_path = os.path.join(self.output_dir, f"best_model_{self.ver_name_list[i]}_{acc2:.4f}.pt")
-                torch.save(backbone.module.state_dict(), detailed_best_model_path)
+                # detailed_best_model_path = os.path.join(self.output_dir, f"best_model_{self.ver_name_list[i]}_{acc2:.4f}.pt")
+                # torch.save(backbone.module.state_dict(), detailed_best_model_path)
                 logging.info('[%s][%d]已保存验证集最佳模型到: %s' % (self.ver_name_list[i], global_step, best_model_path))
-                logging.info('[%s][%d]已保存详细验证集最佳模型到: %s' % (self.ver_name_list[i], global_step, detailed_best_model_path))
+                # logging.info('[%s][%d]已保存详细验证集最佳模型到: %s' % (self.ver_name_list[i], global_step, detailed_best_model_path))
             logging.info(
                 '[%s][%d]Accuracy-Highest: %1.5f' % (self.ver_name_list[i], global_step, self.highest_acc_list[i]))
             results.append(acc2)

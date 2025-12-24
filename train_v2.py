@@ -1,25 +1,23 @@
 import argparse
-import logging
-from torchvision import transforms
 import os
 from datetime import datetime
-from PIL import Image
-import numpy as np
+
 import torch
+from torch import distributed
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+import logging
 from backbones import get_model
-from dataset import get_dataloader
+from dataset import get_dataloader, get_record_info
 from losses import CombinedMarginLoss
 from lr_scheduler import PolynomialLRWarmup
 from partial_fc_v2 import PartialFC_V2
-from torch import distributed
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from utils.utils_callbacks import CallBackLogging, CallBackVerification
 from utils.utils_config import get_config
 from utils.utils_distributed_sampler import setup_seed
 from utils.utils_logging import AverageMeter, init_logging
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
-from testarcface import runtest 
 
 # 调用另一个 Python 文件
 #subprocess.run(["python", "path/to/other_script.py"])
@@ -49,6 +47,17 @@ def main(args):
     
     # get config
     cfg = get_config(args.config)
+    
+    # 获取record文件的样本数和种类数
+    print("读取Record文件信息...")
+    num_samples, num_classes = get_record_info(cfg.rec)
+    print(f"Record文件信息: 样本数={num_samples}, 种类数={num_classes}")
+    
+    # 更新配置文件中的参数
+    cfg.num_image = num_samples
+    cfg.num_classes = num_classes
+    print("配置文件参数已更新")
+    
     # global control random seed
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 

@@ -36,6 +36,7 @@ from mxnet import ndarray as nd
 from scipy import interpolate
 from sklearn.decomposition import PCA
 from sklearn.model_selection import KFold
+from tqdm import tqdm
 
 
 class LFold:
@@ -239,8 +240,9 @@ def load_bin(path, image_size):
         data = torch.empty((len(issame_list) * 2, 3, image_size[0], image_size[1]))
         data_list.append(data)
     
-    # 遍历所有图像对
-    for idx in range(len(issame_list) * 2):
+    # 遍历所有图像对，使用tqdm显示进度条
+    total_images = len(issame_list) * 2
+    for idx in tqdm(range(total_images), desc="Loading verification bin", unit="image"):
         # 获取当前图像的二进制数据
         _bin = bins[idx]
         # 使用mxnet解码图像
@@ -260,10 +262,6 @@ def load_bin(path, image_size):
                 img = mx.ndarray.flip(data=img, axis=2)
             # 将mxnet的ndarray转换为pytorch的Tensor并存储
             data_list[flip][idx][:] = torch.from_numpy(img.asnumpy())
-        
-        # 每处理1000张图像打印一次进度
-        if idx % 1000 == 0:
-            print('loading bin', idx)
     
     # 打印加载完成的数据形状
     print(data_list[0].shape)
@@ -278,6 +276,18 @@ def test(data_set, backbone, batch_size, nfolds=10):
     issame_list = data_set[1]
     embeddings_list = []
     time_consumed = 0.0
+    
+    # 计算总批次数量
+    total_batches = 0
+    for i in range(len(data_list)):
+        data = data_list[i]
+        total_batches += (data.shape[0] + batch_size - 1) // batch_size
+    
+    # 使用tqdm创建进度条
+    from tqdm import tqdm
+    pbar = tqdm(total=total_batches, desc='Verification Progress', unit='batch')
+    current_batch = 0
+    
     for i in range(len(data_list)):
         data = data_list[i]
         embeddings = None
@@ -297,7 +307,55 @@ def test(data_set, backbone, batch_size, nfolds=10):
                 embeddings = np.zeros((data.shape[0], _embeddings.shape[1]))
             embeddings[ba:bb, :] = _embeddings[(batch_size - count):, :]
             ba = bb
+            
+            # 更新进度条
+            current_batch += 1
+            pbar.update(1)
+            
+            # 计算预计剩余时间
+            if current_batch > 0:
+                avg_time_per_batch = time_consumed / current_batch
+                remaining_batches = total_batches - current_batch
+                estimated_remaining_time = avg_time_per_batch * remaining_batches
+                
+                # 计算当前准确率（每处理10个批次计算一次，避免频繁计算影响性能）
+                if current_batch % 10 == 0 and embeddings is not None:
+                    # 临时计算当前的embeddings - 只使用当前批次的数据进行估计
+                    # 只使用当前批次的embeddings进行临时计算
+                    temp_embeddings = embeddings[:ba]
+                    temp_embeddings = sklearn.preprocessing.normalize(temp_embeddings)
+                    
+                    # 只计算部分样本的准确率以提高速度
+                    sample_size = min(1000, len(issame_list))
+                    
+                    # 确保我们有足够的样本进行计算
+                    if len(temp_embeddings) >= 2 * sample_size:
+                        temp_embeddings_sample = temp_embeddings[:sample_size*2]
+                        temp_issame_sample = issame_list[:sample_size]
+                        
+                        thresholds = np.arange(0, 4, 0.01)
+                        temp_embeddings1 = temp_embeddings_sample[0::2]
+                        temp_embeddings2 = temp_embeddings_sample[1::2]
+                        
+                        try:
+                            tpr, fpr, accuracy = calculate_roc(thresholds, temp_embeddings1, temp_embeddings2, 
+                                                              np.asarray(temp_issame_sample), nrof_folds=2, pca=0)
+                            current_acc = np.mean(accuracy)
+                        except Exception as e:
+                            current_acc = 0.0
+                    else:
+                        current_acc = 0.0
+                    
+                    # 更新进度条显示
+                    pbar.set_postfix({
+                        'Accuracy': f'{current_acc:.4f}',
+                        'Est. Remaining': f'{estimated_remaining_time:.2f}s'
+                    })
+        
         embeddings_list.append(embeddings)
+    
+    # 关闭进度条
+    pbar.close()
 
     _xnorm = 0.0
     _xnorm_cnt = 0
@@ -322,51 +380,51 @@ def test(data_set, backbone, batch_size, nfolds=10):
     return acc1, std1, acc2, std2, _xnorm, embeddings_list
 
 
-def dumpR(data_set,
-          backbone,
-          batch_size,
-          name='',
-          data_extra=None,
-          label_shape=None):
-    print('dump verification embedding..')
-    data_list = data_set[0]
-    issame_list = data_set[1]
-    embeddings_list = []
-    time_consumed = 0.0
-    for i in range(len(data_list)):
-        data = data_list[i]
-        embeddings = None
-        ba = 0
-        while ba < data.shape[0]:
-            bb = min(ba + batch_size, data.shape[0])
-            count = bb - ba
-
-            _data = nd.slice_axis(data, axis=0, begin=bb - batch_size, end=bb)
-            time0 = datetime.datetime.now()
-            if data_extra is None:
-                db = mx.io.DataBatch(data=(_data,), label=(_label,))
-            else:
-                db = mx.io.DataBatch(data=(_data, _data_extra),
-                                     label=(_label,))
-            model.forward(db, is_train=False)
-            net_out = model.get_outputs()
-            _embeddings = net_out[0].asnumpy()
-            time_now = datetime.datetime.now()
-            diff = time_now - time0
-            time_consumed += diff.total_seconds()
-            if embeddings is None:
-                embeddings = np.zeros((data.shape[0], _embeddings.shape[1]))
-            embeddings[ba:bb, :] = _embeddings[(batch_size - count):, :]
-            ba = bb
-        embeddings_list.append(embeddings)
-    embeddings = embeddings_list[0] + embeddings_list[1]
-    embeddings = sklearn.preprocessing.normalize(embeddings)
-    actual_issame = np.asarray(issame_list)
-    outname = os.path.join('temp.bin')
-    with open(outname, 'wb') as f:
-        pickle.dump((embeddings, issame_list),
-                    f,
-                    protocol=pickle.HIGHEST_PROTOCOL)
+# def dumpR(data_set,
+#           backbone,
+#           batch_size,
+#           name='',
+#           data_extra=None,
+#           label_shape=None):
+#     print('dump verification embedding..')
+#     data_list = data_set[0]
+#     issame_list = data_set[1]
+#     embeddings_list = []
+#     time_consumed = 0.0
+#     for i in range(len(data_list)):
+#         data = data_list[i]
+#         embeddings = None
+#         ba = 0
+#         while ba < data.shape[0]:
+#             bb = min(ba + batch_size, data.shape[0])
+#             count = bb - ba
+#
+#             _data = nd.slice_axis(data, axis=0, begin=bb - batch_size, end=bb)
+#             time0 = datetime.datetime.now()
+#             if data_extra is None:
+#                 db = mx.io.DataBatch(data=(_data,), label=(_label,))
+#             else:
+#                 db = mx.io.DataBatch(data=(_data, _data_extra),
+#                                      label=(_label,))
+#             model.forward(db, is_train=False)
+#             net_out = model.get_outputs()
+#             _embeddings = net_out[0].asnumpy()
+#             time_now = datetime.datetime.now()
+#             diff = time_now - time0
+#             time_consumed += diff.total_seconds()
+#             if embeddings is None:
+#                 embeddings = np.zeros((data.shape[0], _embeddings.shape[1]))
+#             embeddings[ba:bb, :] = _embeddings[(batch_size - count):, :]
+#             ba = bb
+#         embeddings_list.append(embeddings)
+#     embeddings = embeddings_list[0] + embeddings_list[1]
+#     embeddings = sklearn.preprocessing.normalize(embeddings)
+#     actual_issame = np.asarray(issame_list)
+#     outname = os.path.join('temp.bin')
+#     with open(outname, 'wb') as f:
+#         pickle.dump((embeddings, issame_list),
+#                     f,
+#                     protocol=pickle.HIGHEST_PROTOCOL)
 
 
 # if __name__ == '__main__':

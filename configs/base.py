@@ -48,7 +48,7 @@ config.gradient_acc = 1
 config.seed = 2048
 
 # dataload numworkers
-config.num_workers = 2
+config.num_workers = 4
 
 config.rec = "/home/zqx/data/clear_before_20241031_align_112_0/cattrain"
 config.num_classes = 610
