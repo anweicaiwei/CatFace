@@ -7,6 +7,7 @@ from torch import distributed
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import logging
 from backbones import get_model
@@ -208,6 +209,7 @@ def main(args):
         frequent=cfg.frequent,
         total_step=cfg.total_step,
         batch_size=cfg.batch_size,
+        total_epoch=cfg.num_epoch,
         start_step = global_step,
         writer=summary_writer
     )
@@ -224,7 +226,28 @@ def main(args):
         
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
-        for idx, (img, local_labels) in enumerate(train_loader):
+        
+        # 为当前轮次初始化进度条
+        if rank == 0:
+            # 显式计算每轮的总批次数
+            total_batches = cfg.num_image // cfg.batch_size
+            train_loader_tqdm = tqdm(
+                train_loader, 
+                desc=f"Epoch {epoch+1}/{cfg.num_epoch}", 
+                unit="batch", 
+                total=total_batches,
+                leave=False,
+                dynamic_ncols=True,
+                position=0,
+                ncols=100,
+                mininterval=0.1,
+                smoothing=0.1,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+            )
+        else:
+            train_loader_tqdm = train_loader
+            
+        for idx, (img, local_labels) in enumerate(train_loader_tqdm):
             # 获取当前 batch 的文件名
             saveImage = False
             if rank == 0 and idx == 0:
@@ -253,27 +276,48 @@ def main(args):
                     lr_scheduler.step()  # 在优化器步骤后调用学习率调度器
 
             with torch.no_grad():
-                # 每10批次记录一次额外的详细日志并检查是否需要保存最佳模型
-                if global_step % 10 == 0 and rank == 0:
-                    # 计算当前批次的准确率
-                    # 获取分类器权重
-                    weight = module_partial_fc.weight.detach()
-                    # 计算嵌入向量与分类器权重的余弦相似度
-                    cosine = torch.mm(local_embeddings, weight.t())
-                    # 获取预测标签
-                    _, predictions = torch.max(cosine, dim=1)
-                    # 计算准确率
-                    accuracy = (predictions == local_labels).float().mean().item()
+                # 每50批次记录一次额外的详细日志
+                if global_step % 50 == 0 and rank == 0:
+                    # 计算当前批次的准确率 - 使用与forward方法相同的逻辑
+                    # 归一化嵌入向量和权重
+                    norm_embeddings = torch.nn.functional.normalize(local_embeddings)
                     
-                    batch_loss = loss.item()
-                    avg_loss = loss_am.avg
-                    current_lr = lr_scheduler.get_last_lr()[0]
-                    
-                    # 记录详细训练参数到日志，包括准确率
-                    logging.info(f"[每10批次] 全局步数: {global_step}, 轮次: {epoch}, "
-                               f"批次索引: {idx}, 当前损失: {batch_loss:.4f}, "
-                               f"平均损失: {avg_loss:.4f}, 学习率: {current_lr:.6f}, "
-                               f"训练准确率: {accuracy:.4f}")
+                    # 检查是否使用部分FC
+                    if module_partial_fc.sample_rate < 1:
+                        # 如果使用部分FC，需要获取当前批次使用的权重和调整后的标签
+                        # 复制forward方法中的逻辑
+                        labels = local_labels.clone().view(-1, 1)
+                        index_positive = (module_partial_fc.class_start <= labels) & \
+                                        (labels < module_partial_fc.class_start + module_partial_fc.num_local)
+                        labels[~index_positive] = -1
+                        labels[index_positive] -= module_partial_fc.class_start
+                        
+                        # 获取当前批次使用的权重
+                        weight_activated = module_partial_fc.sample(labels, index_positive)
+                        norm_weight_activated = torch.nn.functional.normalize(weight_activated)
+                        
+                        # 计算logits
+                        cosine = torch.mm(norm_embeddings, norm_weight_activated.t())
+                        
+                        # 获取预测标签
+                        _, predictions = torch.max(cosine, dim=1)
+                        
+                        # 只计算有效的标签（即属于当前GPU的样本）的准确率
+                        valid_mask = (labels.squeeze() != -1)
+                        if valid_mask.sum() > 0:
+                            accuracy = (predictions[valid_mask] == labels.squeeze()[valid_mask]).float().mean().item()
+                        else:
+                            accuracy = 0.0
+                    else:
+                        # 如果不使用部分FC，直接计算
+                        norm_weight = torch.nn.functional.normalize(module_partial_fc.weight.detach())
+                        cosine = torch.mm(norm_embeddings, norm_weight.t())
+                        _, predictions = torch.max(cosine, dim=1)
+                        accuracy = (predictions == local_labels).float().mean().item()
+
+                    # batch_loss = loss.item()
+                    # avg_loss = loss_am.avg
+                    # current_lr = lr_scheduler.get_last_lr()[0]
                     
                     # 如果有wandb_logger，也记录准确率
                     if wandb_logger:
@@ -288,6 +332,13 @@ def main(args):
                         current_epoch_best_accuracy = accuracy
                         current_epoch_best_step = global_step
                 
+                # 更新进度条信息
+                if rank == 0:
+                    batch_loss = loss.item()
+                    avg_loss = loss_am.avg
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    train_loader_tqdm.set_postfix({'loss': f'{batch_loss:.4f}', 'avg_loss': f'{avg_loss:.4f}', 'lr': f'{current_lr:.6f}'})
+                
                 if wandb_logger:
                     wandb_logger.log({
                         'Loss/Step Loss': loss.item(),
@@ -296,26 +347,60 @@ def main(args):
                         'Process/Epoch': epoch
                     })
                     
-                # 计算当前batch的准确率
-                weight = module_partial_fc.weight.detach()
-                cosine = torch.mm(local_embeddings, weight.t())
-                _, predictions = torch.max(cosine, dim=1)
-                accuracy = (predictions == local_labels).float().mean().item()
+                # 计算当前batch的准确率 - 使用与forward方法相同的逻辑
+                # 归一化嵌入向量和权重
+                norm_embeddings = torch.nn.functional.normalize(local_embeddings)
+                
+                # 检查是否使用部分FC
+                if module_partial_fc.sample_rate < 1:
+                    # 如果使用部分FC，需要获取当前批次使用的权重和调整后的标签
+                    # 复制forward方法中的逻辑
+                    labels = local_labels.clone().view(-1, 1)
+                    index_positive = (module_partial_fc.class_start <= labels) & \
+                                    (labels < module_partial_fc.class_start + module_partial_fc.num_local)
+                    labels[~index_positive] = -1
+                    labels[index_positive] -= module_partial_fc.class_start
+                    
+                    # 获取当前批次使用的权重
+                    weight_activated = module_partial_fc.sample(labels, index_positive)
+                    norm_weight_activated = torch.nn.functional.normalize(weight_activated)
+                    
+                    # 计算logits
+                    cosine = torch.mm(norm_embeddings, norm_weight_activated.t())
+                    
+                    # 获取预测标签
+                    _, predictions = torch.max(cosine, dim=1)
+                    
+                    # 只计算有效的标签（即属于当前GPU的样本）的准确率
+                    valid_mask = (labels.squeeze() != -1)
+                    if valid_mask.sum() > 0:
+                        accuracy = (predictions[valid_mask] == labels.squeeze()[valid_mask]).float().mean().item()
+                    else:
+                        accuracy = 0.0
+                else:
+                    # 如果不使用部分FC，直接计算
+                    norm_weight = torch.nn.functional.normalize(module_partial_fc.weight.detach())
+                    cosine = torch.mm(norm_embeddings, norm_weight.t())
+                    _, predictions = torch.max(cosine, dim=1)
+                    accuracy = (predictions == local_labels).float().mean().item()
+                
                 accuracy_am.update(accuracy, img.size(0))
                 
-                # 计算准确率用于callback_logging
+                # 计算准确率用于callback_logging，每50批次计算一次
                 train_accuracy = None
-                if global_step % cfg.frequent == 0 and rank == 0:
+                if global_step % 50 == 0 and rank == 0:
                     train_accuracy = accuracy
                 
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp, train_accuracy)
-
-                if global_step % cfg.verbose == 0 and global_step > 0:
-                    callback_verification(global_step, backbone)
+                # 每50批次调用一次callback_logging
+                if global_step % 50 == 0 and rank == 0:
+                    callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp, train_accuracy)
         
-        # 轮次结束时，记录当前轮次中准确率最高的批次信息（仅用于日志记录）
+        # 轮次结束后执行验证
         with torch.no_grad():
+            callback_verification(global_step, backbone)
+            
+            # 记录当前轮次中准确率最高的批次信息（仅用于日志记录）
             if current_epoch_best_step > 0 and rank == 0:
                 # 记录当前轮次最佳批次信息
                 logging.info(f"[第{epoch+1}轮结束] 当前轮次中准确率最高的批次为 #{current_epoch_best_step}, 批次准确率: {current_epoch_best_accuracy:.4f}")

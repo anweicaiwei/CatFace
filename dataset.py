@@ -98,7 +98,8 @@ def get_dataloader(
     # 构建Mxnet RecordIO数据文件路径
     rec = os.path.join(root_dir, 'train.rec')
     idx = os.path.join(root_dir, 'train.idx')
-    print()
+    print(f"Record file: {rec}")
+    print(f"Index file: {idx}")
     # 初始化训练数据集对象
     train_set = None
 
@@ -112,12 +113,14 @@ def get_dataloader(
     # 处理Mxnet RecordIO格式数据
     elif os.path.exists(rec) and os.path.exists(idx):
         # 使用MXFaceDataset加载RecordIO格式的人脸数据集
+        print("Loading MXFaceDataset...")
         train_set = MXFaceDataset(root_dir=root_dir, local_rank=local_rank)
 
     # 处理Image Folder格式数据
     else:
         # 定义图像变换和数据增强操作
         transform = transforms.Compose([
+             transforms.Resize((112, 112), interpolation='bilinear'),  # 改为线性插值避免黑边
              transforms.RandomHorizontalFlip(),  # 随机水平翻转
              transforms.RandomRotation(10),  # 随机旋转±10度
              transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # 颜色抖动
@@ -133,6 +136,8 @@ def get_dataloader(
 
     # 如果启用DALI加速，返回DALI数据加载器
     if dali:
+        # 打印DALI数据加载器信息
+        print("Loading DALI DataLoader...")
         return dali_data_iter(
             batch_size=batch_size, rec_file=rec, idx_file=idx,
             num_threads=2, local_rank=local_rank, dali_aug=dali_aug)
@@ -231,6 +236,7 @@ class MXFaceDataset(Dataset):
         super(MXFaceDataset, self).__init__()
         self.transform = transforms.Compose(
             [transforms.ToPILImage(),
+             transforms.Resize((112, 112), interpolation='bilinear'),  # 改为线性插值避免黑边
              transforms.RandomHorizontalFlip(),
              transforms.RandomRotation(10),
              transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
@@ -375,7 +381,10 @@ def dali_data_iter(
             num_shards=world_size, shard_id=rank,
             random_shuffle=random_shuffle, pad_last_batch=False, name=name)
         images = fn.decoders.image(jpegs, device="mixed", output_type=types.RGB)
+        # 确保所有图像都调整为112x112大小，使用线性插值避免黑边
+        images = fn.resize(images, size=(112, 112), interp_type=types.DALIInterpType.INTERP_LINEAR)
         if dali_aug:
+            print("DALI Augmentation Enabled")
             images = fn.cast(images, dtype=types.UINT8)
             images = multiplexing(condition_resize, dali_random_resize(images, size_resize, image_size=112), images)
             images = multiplexing(condition_blur, dali_random_gaussian_blur(images, window_size_blur), images)

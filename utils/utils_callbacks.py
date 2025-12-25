@@ -117,7 +117,7 @@ class CallBackVerification(object):
 
 
 class CallBackLogging(object):
-    def __init__(self, frequent, total_step, batch_size, start_step=0,writer=None):
+    def __init__(self, frequent, total_step, batch_size, total_epoch, start_step=0, writer=None):
         self.frequent: int = frequent
         self.rank: int = distributed.get_rank()
         self.world_size: int = distributed.get_world_size()
@@ -125,6 +125,7 @@ class CallBackLogging(object):
         self.total_step: int = total_step
         self.start_step: int = start_step
         self.batch_size: int = batch_size
+        self.total_epoch: int = total_epoch
         self.writer = writer
 
         self.init = False
@@ -167,7 +168,7 @@ class CallBackLogging(object):
                     "当前批次损失": f"{loss.val:.4f}",
                     "平均损失": f"{loss.avg:.4f}",
                     "学习率": f"{learning_rate:.6f}",
-                    "轮次": epoch,
+                    "轮次": f"{epoch+1}/{self.total_epoch}",
                     "全局步数": global_step,
                     "剩余时间": f"{time_for_end:.1f} 小时"
                 }

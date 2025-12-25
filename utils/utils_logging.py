@@ -4,6 +4,16 @@ import sys
 import logging.handlers
 
 
+class BatchLogFilter(logging.Filter):
+    """
+    过滤器类，用于过滤掉包含"[训练批次 #"或"[每50批次]"的日志
+    仅应用于控制台日志处理器，文件日志不受影响
+    """
+    def filter(self, record):
+        # 如果日志消息包含"[训练批次 #"，返回False表示不记录
+        return "[训练批次 #" not in record.msg
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value
     """
@@ -73,9 +83,12 @@ def init_logging(rank, models_root):
     log_root.debug(f"文件是否可写: {os.access(models_root, os.W_OK)}")
     
     # 控制台日志处理器（只显示INFO及以上级别）
-    handler_stream = logging.StreamHandler(sys.stdout)
+    # 使用stderr而不是stdout，避免与tqdm进度条冲突
+    handler_stream = logging.StreamHandler(sys.stderr)
     handler_stream.setLevel(logging.INFO)  # 控制台只显示重要信息
     handler_stream.setFormatter(formatter)
+    # 添加过滤器，过滤掉训练批次相关的频繁日志
+    handler_stream.addFilter(BatchLogFilter())
     log_root.addHandler(handler_stream)
     
     # 记录初始化信息

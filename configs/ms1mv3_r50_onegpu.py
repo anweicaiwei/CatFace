@@ -22,6 +22,6 @@ config.dali = True
 config.rec = "data"
 config.num_classes = 610
 config.num_image = 7112
-config.num_epoch = 40
+config.num_epoch = 50
 config.warmup_epoch = 0
 config.val_targets = ['lfw', 'cfp_fp', "agedb_30"]
